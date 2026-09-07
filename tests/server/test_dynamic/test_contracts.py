@@ -53,6 +53,7 @@ from tests.server.test_dynamic.test_submission import (
 # hangs past the deadline exercises the round-timeout cancellation path.
 _TIMEOUT_DYNAMIC_YAML = """
 name: dynamic
+type: dynamic
 goal: analyze market data
 driver:
   model: Qwen/Qwen3-8B
@@ -69,6 +70,7 @@ driver:
 # round-0 construction path produces a visibly different graph.
 _ROUND0_DIFF_YAML = """
 name: dynamic
+type: dynamic
 goal: analyze market data
 driver:
   model: Qwen/Qwen3-32B
@@ -1173,12 +1175,12 @@ async def test_submit_and_preview_reject_same_invalid_dynamic(
         submit_resp = await client.post(
             "/jobs",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
         preview_resp = await client.post(
             "/jobs/preview",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert (
         submit_resp.status_code == 422
@@ -1221,12 +1223,12 @@ async def test_submit_and_preview_accept_same_valid_dynamic(
         submit_resp = await client.post(
             "/jobs",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
         preview_resp = await client.post(
             "/jobs/preview",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert (
         submit_resp.status_code == 200
@@ -1267,12 +1269,12 @@ async def test_submit_and_preview_derive_same_effective_location(
         submit_resp = await client.post(
             "/jobs",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
         preview_resp = await client.post(
             "/jobs/preview",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert submit_resp.status_code == 200, submit_resp.text
     assert preview_resp.status_code == 200, preview_resp.text
@@ -1325,7 +1327,7 @@ async def test_loop_build_round_failure_reaches_terminal(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1348,7 +1350,7 @@ async def test_loop_child_failure_reaches_terminal(app: Any, job_routes: Any) ->
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1372,7 +1374,7 @@ async def test_loop_child_cancelled_reaches_terminal(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1403,7 +1405,7 @@ async def test_loop_child_no_result_reaches_terminal(app: Any, job_routes: Any) 
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1423,7 +1425,7 @@ async def test_loop_invalid_plan_reaches_terminal(app: Any, job_routes: Any) -> 
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1442,7 +1444,7 @@ async def test_loop_missing_leaf_reaches_terminal(app: Any, job_routes: Any) -> 
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1481,7 +1483,7 @@ async def test_loop_register_resource_failure_reaches_terminal(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1515,7 +1517,7 @@ async def test_loop_storage_save_failure_reaches_terminal(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1583,7 +1585,7 @@ async def test_loop_terminal_status_persisted_and_hooks_fire_once(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1672,7 +1674,7 @@ async def test_loop_failed_terminal_persisted_and_hooks_fire_once(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1747,7 +1749,7 @@ async def test_loop_cancelled_terminal_persisted_and_hooks_fire_once(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1792,7 +1794,7 @@ async def test_cancel_job_with_failing_backend_cancel_marks_child_failed(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1807,7 +1809,7 @@ async def test_cancel_job_with_failing_backend_cancel_marks_child_failed(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         cancel_resp = await client.post(
             f"/jobs/{job_id}/cancel",
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert cancel_resp.status_code == 200, cancel_resp.text
     await loop_task
@@ -1832,7 +1834,7 @@ async def test_round_timeout_with_failing_backend_cancel_marks_child_failed(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_TIMEOUT_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1943,7 +1945,7 @@ async def test_runtime_reported_cancellation_marks_record_cancelled(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -1987,7 +1989,7 @@ async def test_terminal_parent_survives_failed_child_path(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -2041,7 +2043,7 @@ async def test_terminal_parent_survives_normal_completion_path(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -2227,7 +2229,7 @@ async def test_round0_render_matches_loop_build(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_ROUND0_DIFF_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     fake_server = job_routes._fake_runtime_server
@@ -2371,12 +2373,12 @@ async def test_renderer_rejections_reach_both_doors(
             submit_resp = await client.post(
                 "/jobs",
                 json=envelope,
-                headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+                headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
             )
             preview_resp = await client.post(
                 "/jobs/preview",
                 json=envelope,
-                headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+                headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
             )
         assert submit_resp.status_code == 422, submit_resp.text
         assert preview_resp.status_code == 422, preview_resp.text
@@ -2420,12 +2422,12 @@ async def test_bare_string_library_entry_rejected_before_renderer(
         submit_resp = await client.post(
             "/jobs",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
         preview_resp = await client.post(
             "/jobs/preview",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert submit_resp.status_code == 422, submit_resp.text
     assert preview_resp.status_code == 422, preview_resp.text

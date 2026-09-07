@@ -1,9 +1,10 @@
-"""Tests for the ``Workflow-Format: dynamic`` submission path.
+"""Tests for the dynamic-workflow submission path.
 
-A dynamic workflow is a YAML spec with a plaintext ``goal`` and a ``driver``
-section. Submitting it renders round 0 into a native graph and runs the
-planning loop server-side; invalid specs are rejected with 422 at submission
-time.
+A dynamic workflow is a YAML spec with a root ``type: dynamic`` plus a
+plaintext ``goal`` and a ``driver`` section. Submitting it renders round 0 into
+a native graph and runs the planning loop server-side; invalid specs are
+rejected at submission time. A YAML without ``type: dynamic`` is a normal
+static workflow.
 """
 
 import asyncio
@@ -34,6 +35,7 @@ _DEMO_PRINCIPAL = PrincipalContext(
 
 _VALID_DYNAMIC_YAML = """
 name: dynamic
+type: dynamic
 goal: analyze market data
 driver:
   model: Qwen/Qwen3-8B
@@ -338,7 +340,7 @@ async def test_dynamic_submit_runs_loop_to_stop(app: FastAPI, job_routes: Any) -
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -364,7 +366,7 @@ async def test_dynamic_round_output_locations_are_distinct(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -406,7 +408,7 @@ async def test_dynamic_child_prefixes_under_parent_effective_base(
         resp = await client.post(
             "/jobs",
             json=envelope,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -445,7 +447,7 @@ async def test_dynamic_cancel_propagates_to_inflight_child(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -459,7 +461,7 @@ async def test_dynamic_cancel_propagates_to_inflight_child(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         cancel_resp = await client.post(
             f"/jobs/{job_id}/cancel",
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert cancel_resp.status_code == 200, cancel_resp.text
     await loop_task
@@ -475,6 +477,7 @@ async def test_dynamic_cancel_propagates_to_inflight_child(
 
 _LIBRARY_DYNAMIC_YAML = """
 name: dynamic
+type: dynamic
 goal: analyze market data
 driver:
   model: Qwen/Qwen3-8B
@@ -507,7 +510,7 @@ async def test_dynamic_multi_round_registry_handoff(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_LIBRARY_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -562,7 +565,7 @@ async def test_dynamic_multi_round_typed_message_ref_handoff(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -612,26 +615,26 @@ async def test_dynamic_multi_round_typed_message_ref_handoff(
 
 
 @pytest.mark.anyio
-async def test_dynamic_submit_invalid_yaml_returns_422(app: FastAPI) -> None:
+async def test_dynamic_submit_invalid_yaml_returns_400(app: FastAPI) -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/jobs",
             json=_submit_body("not: [valid"),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
 
 
 @pytest.mark.anyio
 async def test_dynamic_submit_missing_goal_returns_422(app: FastAPI) -> None:
-    spec = "name: dynamic\ndriver:\n  model: Qwen/Qwen3-8B\n"
+    spec = "name: dynamic\ntype: dynamic\ndriver:\n  model: Qwen/Qwen3-8B\n"
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/jobs",
             json=_submit_body(spec),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 422
 
@@ -644,7 +647,7 @@ async def test_dynamic_max_rounds_cutoff(app: FastAPI, job_routes: Any) -> None:
         resp = await client.post(
             "/jobs",
             json=_submit_body(spec_yaml),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -668,7 +671,7 @@ async def test_dynamic_round_failure_fails_parent(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -690,7 +693,7 @@ async def test_dynamic_malformed_plan_fails_parent(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -724,7 +727,7 @@ async def test_dynamic_build_round_failure_fails_parent(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -747,7 +750,7 @@ async def test_dynamic_missing_leaf_outputs_fails_parent(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -778,7 +781,7 @@ async def test_dynamic_stop_round_missing_leaf_fails_parent(
         resp = await client.post(
             "/jobs",
             json=_submit_body(_VALID_DYNAMIC_YAML),
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 200, resp.text
     job_id = resp.json()["data"]["job_id"]
@@ -816,7 +819,7 @@ async def test_dynamic_submit_multi_entry_returns_422(app: FastAPI) -> None:
         resp = await client.post(
             "/jobs",
             json=body,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 422
 
@@ -830,7 +833,7 @@ async def test_dynamic_submit_empty_symbol_returns_422(app: FastAPI) -> None:
         resp = await client.post(
             "/jobs",
             json=body,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 422
 
@@ -856,7 +859,7 @@ async def test_dynamic_preview_multi_entry_returns_422(app: FastAPI) -> None:
         resp = await client.post(
             "/jobs/preview",
             json=body,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 422
 
@@ -870,7 +873,7 @@ async def test_dynamic_preview_empty_symbol_returns_422(app: FastAPI) -> None:
         resp = await client.post(
             "/jobs/preview",
             json=body,
-            headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
         )
     assert resp.status_code == 422
 
@@ -894,6 +897,82 @@ async def test_dynamic_preview_entry_db_location_returns_422(app: FastAPI) -> No
         resp = await client.post(
             "/jobs/preview",
             json=body,
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
+        )
+    assert resp.status_code == 422
+
+
+_STATIC_YAML = """
+name: static
+inputs:
+  Symbols: ["NVDA"]
+ops:
+  - id: "Greeting"
+    op: FormatOp
+    inputs: [Symbols]
+    template: "Hello, {name}!"
+    format_kwargs:
+      name: Symbols
+outputs:
+  - name: reply
+    ref: "Greeting"
+"""
+
+
+@pytest.mark.anyio
+async def test_static_yaml_without_type_runs_as_static(
+    app: FastAPI, job_routes: Any
+) -> None:
+    """A YAML workflow with no ``type`` field defaults to static: it is parsed
+    as a normal graph and dispatched through the static ``_run_job`` path, not
+    the dynamic planning loop."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/jobs",
+            json=_submit_body(_STATIC_YAML),
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
+        )
+    assert resp.status_code == 200, resp.text
+    job_id = resp.json()["data"]["job_id"]
+    await _run_background(app)
+    record = job_routes.jobs[job_id]
+    assert record.status == "completed"
+    # A static job is a single job with no dynamic child rounds.
+    assert record.child_job_ids == []
+
+
+@pytest.mark.anyio
+async def test_static_yaml_with_explicit_static_type_runs_as_static(
+    app: FastAPI, job_routes: Any
+) -> None:
+    """A YAML workflow with ``type: static`` is also treated as static."""
+    static_yaml = _STATIC_YAML.replace("name: static\n", "name: static\ntype: static\n")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/jobs",
+            json=_submit_body(static_yaml),
+            headers={"Authorization": "Bearer token", "Workflow-Format": "yaml"},
+        )
+    assert resp.status_code == 200, resp.text
+    job_id = resp.json()["data"]["job_id"]
+    await _run_background(app)
+    record = job_routes.jobs[job_id]
+    assert record.status == "completed"
+    assert record.child_job_ids == []
+
+
+@pytest.mark.anyio
+async def test_dynamic_format_header_rejected(app: FastAPI) -> None:
+    """The ``dynamic`` Workflow-Format value is dropped; it must be rejected
+    with 422. Dynamic workflows are now differentiated by the YAML root
+    ``type: dynamic`` field instead."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/jobs",
+            json=_submit_body(_VALID_DYNAMIC_YAML),
             headers={"Authorization": "Bearer token", "Workflow-Format": "dynamic"},
         )
     assert resp.status_code == 422

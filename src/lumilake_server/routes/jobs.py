@@ -2216,8 +2216,7 @@ async def preview_job(
         alias="Workflow-Format",
         description=(
             "Workflow format: `native` (compiled Lumilake graph JSON), "
-            "`n8n` (n8n workflow payload), `yaml` (Lumilake YAML workflow), "
-            "or `dynamic` (dynamic workflow YAML spec)."
+            "`n8n` (n8n workflow payload), `yaml` (Lumilake YAML workflow)."
         ),
     ),
 ) -> dict[str, Any]:
@@ -2234,10 +2233,10 @@ async def preview_job(
             detail=f"Invalid JSON body: {exc}",
         ) from exc
     workflow_format = workflow_format.lower()
-    if workflow_format not in {"native", "n8n", "yaml", "dynamic"}:
+    if workflow_format not in {"native", "n8n", "yaml"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Workflow-Format must be 'native', 'n8n', 'yaml', or 'dynamic'",
+            detail="Workflow-Format must be 'native', 'n8n', or 'yaml'",
         )
 
     try:
@@ -2258,19 +2257,24 @@ async def preview_job(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="data must contain at least one entry",
         )
-    if workflow_format == "dynamic" and len(entries) != 1:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="dynamic workflow requires exactly one entry per submission",
-        )
-
     graph_specs: dict[str, dict[str, Any]] = {}
     workflow_slices: dict[str, WorkflowSliceMeta] = {}
     seen_public_names: set[str] = set()
     preview_request_id = f"preview-{unique_id()}"
 
     for idx, entry in enumerate(entries):
-        if workflow_format == "dynamic":
+        workflow_payload = _decode_workflow_body(entry.workflow, workflow_format, idx)
+        is_dynamic = (
+            workflow_format == "yaml"
+            and isinstance(workflow_payload, dict)
+            and workflow_payload.get("type") == "dynamic"
+        )
+        if is_dynamic and len(entries) != 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="dynamic workflow requires exactly one entry per submission",
+            )
+        if is_dynamic:
             dynamic_spec = _decode_dynamic_spec(entry.workflow, idx)
             workflow_payload, dynamic_output_location = _render_dynamic_round0(
                 dynamic_spec
@@ -2279,10 +2283,6 @@ async def preview_job(
             # so both doors reject the same malformed dynamic specs.
             _effective_dynamic_output_location(
                 dynamic_output_location, entry.output_location
-            )
-        else:
-            workflow_payload = _decode_workflow_body(
-                entry.workflow, workflow_format, idx
             )
 
         name = entry.name or f"graph_{idx}"
@@ -2310,7 +2310,7 @@ async def preview_job(
                 detail=str(exc),
             ) from exc
 
-        if workflow_format == "dynamic":
+        if is_dynamic:
             _validate_dynamic_submission({name: inputs})
 
         input_batch_size = entry.input_batch_size
@@ -2338,7 +2338,7 @@ async def preview_job(
                 detail=f"duplicate internal graph name: {graph_name}",
             )
         _dispatch_workflow_to_graph_specs(
-            workflow_format=workflow_format,
+            workflow_format="native" if is_dynamic else workflow_format,
             workflow_payload=workflow_payload,
             batch_inputs=first_batch,
             graph_name=graph_name,
@@ -2579,8 +2579,7 @@ async def submit_job(
         alias="Workflow-Format",
         description=(
             "Workflow format: `native` (compiled Lumilake graph JSON), "
-            "`n8n` (n8n workflow payload), `yaml` (Lumilake YAML workflow), "
-            "or `dynamic` (dynamic workflow YAML spec)."
+            "`n8n` (n8n workflow payload), `yaml` (Lumilake YAML workflow)."
         ),
     ),
 ) -> dict[str, Any]:
@@ -2597,10 +2596,10 @@ async def submit_job(
             detail=f"Invalid JSON body: {exc}",
         ) from exc
     workflow_format = workflow_format.lower()
-    if workflow_format not in {"native", "n8n", "yaml", "dynamic"}:
+    if workflow_format not in {"native", "n8n", "yaml"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Workflow-Format must be 'native', 'n8n', 'yaml', or 'dynamic'",
+            detail="Workflow-Format must be 'native', 'n8n', or 'yaml'",
         )
 
     try:
@@ -2622,11 +2621,6 @@ async def submit_job(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="data must contain at least one entry",
         )
-    if workflow_format == "dynamic" and len(entries) != 1:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="dynamic workflow requires exactly one entry per submission",
-        )
     job_id = f"req-{unique_id()}"
     graph_specs: dict[str, dict[str, Any]] = {}
     workflow_slices: dict[str, WorkflowSliceMeta] = {}
@@ -2636,14 +2630,21 @@ async def submit_job(
     dynamic_spec: DynamicSpec | None = None
     for idx, entry in enumerate(entries):
         dynamic_output_location: dict[str, Any] | None = None
-        if workflow_format == "dynamic":
+        workflow_payload = _decode_workflow_body(entry.workflow, workflow_format, idx)
+        is_dynamic = (
+            workflow_format == "yaml"
+            and isinstance(workflow_payload, dict)
+            and workflow_payload.get("type") == "dynamic"
+        )
+        if is_dynamic and len(entries) != 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="dynamic workflow requires exactly one entry per submission",
+            )
+        if is_dynamic:
             dynamic_spec = _decode_dynamic_spec(entry.workflow, idx)
             workflow_payload, dynamic_output_location = _render_dynamic_round0(
                 dynamic_spec
-            )
-        else:
-            workflow_payload = _decode_workflow_body(
-                entry.workflow, workflow_format, idx
             )
 
         name = entry.name or f"graph_{idx}"
@@ -2732,7 +2733,7 @@ async def submit_job(
                 {key: list(vals) for key, vals in batch_inputs.items()},
             )
             _dispatch_workflow_to_graph_specs(
-                workflow_format=workflow_format,
+                workflow_format="native" if is_dynamic else workflow_format,
                 workflow_payload=workflow_payload,
                 batch_inputs=batch_inputs,
                 graph_name=graph_name,
@@ -2771,7 +2772,7 @@ async def submit_job(
             ),
         )
 
-    if workflow_format == "dynamic" and dynamic_spec is not None:
+    if is_dynamic and dynamic_spec is not None:
         # Validate the one-symbol contract before creating the parent record,
         # so an invalid request returns 422 without leaving an orphan job.
         _validate_dynamic_submission(resolved_inputs)
@@ -2798,7 +2799,7 @@ async def submit_job(
         hook_logger,
     )
 
-    if workflow_format == "dynamic" and dynamic_spec is not None:
+    if is_dynamic and dynamic_spec is not None:
         # The dynamic run is the parent; each round is a child job.
         name = next(iter(resolved_inputs))
         symbols = list(resolved_inputs[name].get(INPUT_NODE_ID, []))

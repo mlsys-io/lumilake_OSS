@@ -6,7 +6,7 @@ validation are handled by pydantic, not hand-rolled.
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import (
@@ -43,6 +43,7 @@ class DynamicSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["dynamic"] = "dynamic"
     name: StrictStr | None = None
     goal: StrictStr
     driver: DriverSettings

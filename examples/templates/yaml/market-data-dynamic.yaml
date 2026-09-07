@@ -1,4 +1,5 @@
 name: market-data-dynamic
+type: dynamic
 
 # Dynamic workflow over real market data. The user supplies a plaintext GOAL;
 # each round the planner (LLM) emits a small acyclic subgraph of ops that
@@ -33,7 +34,8 @@ name: market-data-dynamic
 #   - The normal Lumilake S3 archive configuration for submitted plans.
 #
 # Submit:
-#   uv run python -c "from lumilake import LumilakeClient; c=LumilakeClient(base_url='http://127.0.0.1:9000'); yaml_text=open('examples/templates/yaml/market-data-dynamic.yaml').read(); print(c.jobs.submit({'data': [{'name': 'demo', 'workflow': yaml_text, 'inputs': {'Symbols': ['NVDA']}, 'output_location': {'type': 's3', 'prefix': 'dynamic/market/'}}]}, workflow_format='dynamic'))"
+#   uv run lumilake job submit -f yaml examples/templates/yaml/market-data-dynamic.yaml \
+#     --input Symbols=NVDA --output-prefix dynamic/market/
 
 goal: >-
   Analyze the market-cap distribution across sectors in two phases. First

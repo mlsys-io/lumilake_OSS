@@ -158,7 +158,8 @@ no Python block class to subclass and no block catalog. Each round the planner
 (an LLM) emits a small acyclic subgraph of ops that advances the goal, or
 `STOP`.
 
-Submit a dynamic workflow to the server with `workflow_format="dynamic"`:
+Submit a dynamic workflow to the server with `workflow_format="yaml"` (the
+YAML's root `type: dynamic` field marks it as dynamic):
 
 ```python
 from lumilake import LumilakeClient
@@ -176,7 +177,7 @@ payload = {
 }
 
 with LumilakeClient(base_url="http://localhost:9000") as client:
-    resp = client.jobs.submit(payload, workflow_format="dynamic")
+    resp = client.jobs.submit(payload, workflow_format="yaml")
     print(resp["job_id"])
 ```
 
