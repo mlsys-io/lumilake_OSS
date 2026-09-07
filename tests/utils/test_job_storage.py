@@ -1,3 +1,4 @@
+import threading
 from dataclasses import dataclass, field
 
 import pytest
@@ -20,6 +21,7 @@ class _Record:
     output_location: dict[str, object] = field(default_factory=dict)
     progress: dict[str, object] = field(default_factory=dict)
     result: dict[str, object] | None = None
+    trace_ids: list[str] = field(default_factory=list)
 
 
 def _record(job_id: str, status: str, submitted_at: str) -> _Record:
@@ -125,3 +127,64 @@ def test_iter_summaries_filters_by_status() -> None:
 
     all_ids = {s.job_id for s in storage.iter_summaries()}
     assert all_ids == {"job-1", "job-2", "job-3"}
+
+
+class _RaceDict(dict[str, threading.Lock]):
+    """Lock map that holds both racers inside the fast-path lookup.
+
+    ``_save_lock`` reads the map once before taking the guard and again inside
+    it. Holding each thread at the barrier just after its *first* read forces
+    both to see an empty map and then race the create-and-insert. Later reads
+    must not block, or the thread holding the guard would wait forever on the
+    thread blocked acquiring it.
+    """
+
+    def __init__(self, barrier: threading.Barrier) -> None:
+        super().__init__()
+        self._barrier = barrier
+        self._arrived: set[int] = set()
+        self._arrived_guard = threading.Lock()
+
+    def get(  # type: ignore[override]
+        self, key: str, default: "threading.Lock | None" = None
+    ) -> "threading.Lock | None":
+        ident = threading.get_ident()
+        with self._arrived_guard:
+            first_read = ident not in self._arrived
+            self._arrived.add(ident)
+        value = super().get(key, default)
+        if first_read:
+            # Block *after* reading, so neither thread's first read can observe
+            # the other's insert.
+            self._barrier.wait(timeout=5)
+        return value
+
+
+def test_save_lock_factory_returns_same_lock_under_race() -> None:
+    """Two threads racing the first-use lock factory get the same lock."""
+    storage = InMemoryJobStorage()
+    job_id = "job-race"
+    # NOTE: no pre-populating save for "job-race" — the first save must race
+    # the lock factory.
+
+    barrier = threading.Barrier(2)
+    storage._save_locks = _RaceDict(barrier)
+
+    locks: list[threading.Lock | None] = [None, None]
+    errors: list[Exception | None] = [None, None]
+
+    def _acquire(idx: int) -> None:
+        try:
+            locks[idx] = storage._save_lock(job_id)
+        except Exception as exc:  # pragma: no cover
+            errors[idx] = exc
+
+    threads = [threading.Thread(target=_acquire, args=(i,)) for i in (0, 1)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+    assert errors == [None, None]
+    assert locks[0] is not None and locks[1] is not None
+    assert locks[0] is locks[1]

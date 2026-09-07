@@ -150,6 +150,97 @@ async for job in async_client.jobs.list_all():
     await process(job)
 ```
 
+### Dynamic workflows
+
+A dynamic workflow is a YAML document with a plaintext `goal` and a `driver`
+section; `name` is optional. The server owns the planning-agent loop: there is
+no Python block class to subclass and no block catalog. Each round the planner
+(an LLM) emits a small acyclic subgraph of ops that advances the goal, or
+`STOP`.
+
+Submit a dynamic workflow to the server with `workflow_format="yaml"` (the
+YAML's root `type: dynamic` field marks it as dynamic):
+
+```python
+from lumilake import LumilakeClient
+
+yaml_text = open("examples/templates/yaml/market-data-dynamic.yaml").read()
+payload = {
+    "data": [
+        {
+            "name": "demo",
+            "workflow": yaml_text,
+            "inputs": {"Symbols": ["NVDA"]},
+            "output_location": {"type": "s3", "prefix": "dynamic/market/"},
+        }
+    ]
+}
+
+with LumilakeClient(base_url="http://localhost:9000") as client:
+    resp = client.jobs.submit(payload, workflow_format="yaml")
+    print(resp["job_id"])
+```
+
+The payload is the server's `JobSubmitRequest` shape: a top-level `data` list,
+each item carrying `workflow` (the YAML text), `inputs`, and `output_location`.
+`output_location` is REQUIRED in every envelope item even when the YAML
+declares `driver.output_location` — the server only gives the YAML value
+precedence after request-model validation. The async client uses the same
+payload with `await client.jobs.submit(...)`.
+
+The server renders round 0, runs each round as a child job, validates each
+emitted subgraph, and stops on `STOP` or `max_rounds`. The parent job owns the
+run's traces and lifecycle. Each round runs one native graph:
+
+- the emitted subgraph runs first (each leaf is archived under a `leaf_<id>`
+  output);
+- the observation LambdaOp computes numeric statistics and a bounded preview
+  of the subgraph's leaf outputs;
+- the proposer LLMChatOp sees the goal, all prior observations, and the overall
+  topology, and emits one structured plan: either `{"next": "STOP"}` or
+  `{"next": "subgraph", "ops": [...]}`.
+
+Within one run, every node can reference any existing node by id from any
+previous round (an accumulated global node registry); nodes are immutable once
+created. A run must target exactly one non-empty symbol. The parent's result
+carries the per-round plans.
+
+The `driver:` YAML settings the server accepts are:
+
+- `model` — proposer model, required.
+- `max_tokens` — proposer token limit, default `768`; must be a positive integer.
+- `temperature` — proposer sampling temperature, default `0.4`.
+- `preview_width` — observation preview character limit, default `900`; must be a positive integer.
+- `job_timeout` — per-job wait timeout in seconds, default `600.0`; must be greater than zero.
+- `max_rounds` — round limit, default `10`.
+- `max_nodes_per_round` — per-round subgraph node limit, default `8`.
+- `threshold` — sufficiency threshold, default `None`.
+- `chat_template_kwargs` — chat-template kwargs for the proposer, default
+  `None`. Use it to turn off a reasoning model's thinking mode (Qwen3:
+  `{enable_thinking: false}`), which otherwise consumes the token budget
+  the plan has to fit behind.
+- `output_location` — OPTIONAL S3 destination. When omitted, the envelope's
+  item-level `output_location` is used. S3 outputs receive a unique
+  run-and-round suffix. DB output locations are rejected: the server has no DB
+  writer, so a DB destination cannot be produced.
+
+A non-default `poll_interval` is REJECTED server-side (the server runs the
+loop, so there is nothing to poll). Output-location writes are best-effort on
+the server: a write failure is logged while the job can still be recorded as
+completed, so `output_location` is not a durability guarantee.
+
+A dynamic spec may declare a `library:` section: named, pre-configured op
+templates the planner can emit by id. Each entry is a full op config (e.g. a
+`DataRetrievalOp` with a real SQL template). The planner references one with
+`{"ref": "<id>", "id": <unique>, "inputs": [...]}`; the template is
+authoritative for its config, so the planner may only override `id` and
+`inputs`. Ops without a `ref` are emitted fully inline. The planner sees the
+library (id, op type, key config) in its system message each round.
+
+The parent job's result carries the per-round plans. Missing, malformed,
+unknown, or wrongly typed plan output fails the parent; it never becomes a
+successful termination.
+
 ## Timeouts
 
 The default HTTP timeout is **300 seconds**, set in `lumilake._base_client.DEFAULT_TIMEOUT`. Override it three ways:

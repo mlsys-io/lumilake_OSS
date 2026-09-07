@@ -1,0 +1,158 @@
+name: market-data-dynamic
+type: dynamic
+
+# Dynamic workflow over real market data. The user supplies a plaintext GOAL;
+# each round the planner (LLM) emits a small acyclic subgraph of ops that
+# advances the goal, the server runs it, observes the result, and feeds the
+# accumulated observations back to the planner. The planner stops when the
+# evidence is sufficient.
+#
+# This example is a genuine multi-round analysis: round 1 emits a broad query
+# (list all sectors with avg market cap), observes the result, and identifies a
+# cluster (e.g. "semiconductors are the outlier"). Round 2 emits a subgraph
+# diving into that specific cluster (e.g. "top 10 semiconductor peers by market
+# cap"), referencing the cluster discovered in round 1. Round 2's subgraph
+# cannot be written in advance — it depends on round 1's result.
+#
+# The cross-round dependency is wired through the library: ``top_sector``
+# returns the single outlier sector, and ``peers_in_sector`` is parameterized by
+# a ``sector`` param whose ``path: items[0].table.sector[0]`` drills into the
+# upstream node's single result row. The planner emits peers_in_sector with the
+# round-1 top_sector
+# node as its input, so the outlier sector flows from round 1's data into round
+# 2's WHERE clause.
+#
+# Inputs:  Symbols=["NVDA"] (exactly one symbol per dynamic run)
+# Output:  archived planner plan for each round; each round's leaf results are
+#          archived under `leaf_<node>` outputs.
+#
+# Runtime requirements:
+#   - LUMID_DATA_URL must point at a lumid-data service exposing the
+#     `reference` schema (e.g. https://lum.id/data), with LUMID_DATA_TOKEN
+#     (or the LUMILAKE_RUNTIME_TOKEN fallback) for auth.
+#   - A FlowMesh worker serving Qwen/Qwen3-8B for the planner.
+#   - The normal Lumilake S3 archive configuration for submitted plans.
+#
+# Submit:
+#   uv run lumilake job submit -f yaml examples/templates/yaml/market-data-dynamic.yaml \
+#     --input Symbols=NVDA --output-prefix dynamic/market/
+
+goal: >-
+  Analyze the market-cap distribution across sectors in two phases. First
+  establish the sector landscape and identify the single outlier sector: run
+  sector_market_cap to list every sector with its average market cap, then run
+  top_sector to pick the one sector with the highest average market cap. In the
+  next round, dive into that outlier sector's top companies by running
+  peers_in_sector, wiring it to the top_sector node from the previous round so
+  its sector value flows into the query. Stop once you have both the outlier
+  sector and its top companies.
+
+driver:
+  model: Qwen/Qwen3-8B
+  max_tokens: 2048
+  # The planner emits a structured plan, not prose; Qwen3's reasoning mode adds
+  # a long <think> block that the plan must still fit behind.
+  chat_template_kwargs:
+    enable_thinking: false
+  max_rounds: 4
+  max_nodes_per_round: 4
+  output_location:
+    type: s3
+    prefix: dynamic/market/
+
+# Reference library: pre-configured op templates the planner can emit by id.
+# An emitted op references one with {"ref": "<id>", "id": <unique>, "inputs":
+# [...]}; the template fills in the rest. The planner may override id and
+# inputs (a matching "op" is asserted, not stored) — the template is
+# authoritative for its config. A retrieval template's inputs wire its declared
+# param slots in order, so the planner can point a {placeholder} at a prior
+# node purely through inputs.
+library:
+  sector_market_cap:
+    op: DataRetrievalOp
+    data_spec:
+      type: lumid
+      mode: sql
+      output_format: jsonl
+      verify: false
+      template: |-
+        SELECT sector, AVG(market_cap) AS avg_market_cap
+        FROM reference.profile
+        GROUP BY sector
+        ORDER BY avg_market_cap DESC
+  top_sector:
+    op: DataRetrievalOp
+    data_spec:
+      type: lumid
+      mode: sql
+      output_format: jsonl
+      verify: false
+      template: |-
+        SELECT sector, AVG(market_cap) AS avg_market_cap
+        FROM reference.profile
+        WHERE sector IS NOT NULL
+        GROUP BY sector
+        ORDER BY avg_market_cap DESC
+        LIMIT 1
+  top_peers:
+    op: DataRetrievalOp
+    data_spec:
+      type: lumid
+      mode: sql
+      output_format: jsonl
+      verify: false
+      template: |-
+        SELECT pe.symbol, pe.peer_symbol, MAX(pr.market_cap) AS market_cap
+        FROM reference.peers pe
+        JOIN reference.profile pr ON pr.symbol = pe.peer_symbol
+        WHERE pe.symbol = '{symbol}'
+        GROUP BY pe.symbol, pe.peer_symbol
+        ORDER BY market_cap DESC
+        LIMIT 10
+      params:
+        - label: symbol
+          node: Symbols
+      param_bindings:
+        - label: symbol
+          input: 0
+  peers_in_sector:
+    op: DataRetrievalOp
+    data_spec:
+      type: lumid
+      mode: sql
+      output_format: jsonl
+      verify: false
+      template: |-
+        SELECT symbol, name, sector, market_cap
+        FROM reference.profile
+        WHERE sector = '{sector}'
+        ORDER BY market_cap DESC
+        LIMIT 10
+      params:
+        - label: sector
+          node: top_sector
+          # Index into the single result item and its first row so the param
+          # resolves to a scalar. `items.table.sector` would collect the column
+          # across all tables into a list-of-lists, which the FlowMesh lumid
+          # SQL executor rejects as a grouped param.
+          path: items[0].table.sector[0]
+      param_bindings:
+        - label: sector
+          input: 0
+  profile:
+    op: DataRetrievalOp
+    data_spec:
+      type: lumid
+      mode: sql
+      output_format: jsonl
+      verify: false
+      template: |-
+        SELECT symbol, name, sector, industry, employees, market_cap
+        FROM reference.profile
+        WHERE symbol = '{symbol}'
+      params:
+        - label: symbol
+          node: Symbols
+      param_bindings:
+        - label: symbol
+          input: 0

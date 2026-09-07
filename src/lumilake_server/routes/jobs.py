@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import copy
 import datetime as dt
 import hashlib
 import io
@@ -8,6 +9,7 @@ import json
 import re
 import tarfile
 import tempfile
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
@@ -32,6 +34,22 @@ from lumilake.log import Logger, init_child_logger, set_trace_id
 from lumilake_hook import ResourceAction, ResourceKind, UsageRow
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
+from lumilake_server.dynamic.blocks import INPUT_NODE_ID
+from lumilake_server.dynamic.driver import (
+    STOP,
+    DriverProtocolError,
+    StopPlan,
+    build_round,
+    compute_observation,
+    plan_to_dict,
+    resolve_subgraph,
+    result_outputs,
+    round_output_location,
+    validate_emitted_subgraph,
+    validate_library,
+    validate_plan,
+)
+from lumilake_server.dynamic.spec import DynamicSpec
 from lumilake_server.graphs import CompiledGraph
 from lumilake_server.hooks.security import (
     authenticate_request,
@@ -87,6 +105,12 @@ JOB_STATUS_DESCRIPTION = (
     "Job lifecycle status: `pending` (queued), `running` (executing), "
     "`completed` (finished successfully), `failed` (finished with error), "
     "`cancelled` (cancelled before completion)."
+)
+
+# The terminal subset of JobStatus: a record in any of these states is
+# finished, so a status another coroutine has already written is authoritative.
+TERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset(
+    {"completed", "failed", "cancelled"}
 )
 
 
@@ -183,6 +207,180 @@ def _decode_workflow_body(raw: str, workflow_format: str, idx: int) -> Any:
         ) from exc
 
 
+def _decode_dynamic_spec(raw: str, idx: int) -> DynamicSpec:
+    """Decode and validate a dynamic workflow YAML spec for index ``idx``.
+
+    Raises ``HTTPException`` 422 for malformed YAML, a non-mapping top level,
+    or a spec that fails ``DynamicSpec`` validation.
+    """
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid dynamic workflow YAML for index {idx}: {exc}",
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Dynamic workflow for index {idx} must contain a mapping at "
+                "the top level"
+            ),
+        )
+    try:
+        return DynamicSpec.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid dynamic workflow spec for index {idx}: {exc}",
+        ) from exc
+
+
+def _effective_dynamic_output_location(
+    dynamic_output_location: dict[str, Any] | None,
+    entry_output_location: Any,
+) -> IOLocation:
+    """Resolve the effective dynamic output location using the shared rule.
+
+    A dynamic spec's declared ``driver.output_location`` takes precedence over
+    the envelope's per-entry location; the shadowed entry location is ignored.
+    DB output locations are rejected. Shared by submit and preview so both doors
+    validate the same effective value.
+    """
+    if dynamic_output_location is not None:
+        try:
+            location = _resolve_output_location(
+                _IO_LOCATION_ADAPTER.validate_python(dynamic_output_location)
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid dynamic workflow driver output_location: {exc}",
+            ) from exc
+    else:
+        try:
+            location = _resolve_output_location(entry_output_location)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+    if isinstance(location, DBLocation):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="DBLocation output is not supported",
+        )
+    return location
+
+
+def _render_dynamic_round0(
+    spec: DynamicSpec,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Render the round-0 native graph for a validated dynamic spec.
+
+    Returns ``(graph, output_location)``, where ``output_location`` is the
+    driver's validated output location, or ``None`` when the spec does not
+    declare one. Raises ``HTTPException`` 422 for an invalid driver config or
+    unsupported op.
+    """
+    # The server-side loop directly awaits each child; it does not poll, so a
+    # non-default poll_interval has no server-side meaning. Reject it.
+    if spec.driver.poll_interval != 2.0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "dynamic workflow poll_interval is not supported server-side; "
+                "omit it or use the default"
+            ),
+        )
+    # None when the spec declares no driver output_location, in which case the
+    # envelope's item-level location stays effective.
+    declared_output_location = spec.driver.output_location
+    try:
+        validate_library(spec.library)
+        round_build = build_round(
+            [],
+            node_registry={},
+            round_index=0,
+            goal=spec.goal,
+            observations=[],
+            topology=[],
+            preview_width=spec.driver.preview_width,
+            model=spec.driver.model,
+            max_tokens=spec.driver.max_tokens,
+            temperature=spec.driver.temperature,
+            threshold=spec.driver.threshold,
+            library=spec.library,
+            chat_template_kwargs=spec.driver.chat_template_kwargs,
+        )
+        return round_build.graph, declared_output_location
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid dynamic workflow spec for index: {exc}",
+        ) from exc
+
+
+def _validate_dynamic_submission(
+    resolved_inputs: dict[str, dict[str, list[str]]],
+) -> None:
+    """Enforce the dynamic one-symbol contract after input resolution.
+
+    Shared by submit and preview so both doors reject the same invalid dynamic
+    requests: exactly one non-empty ``Symbols`` value.
+    """
+    name = next(iter(resolved_inputs))
+    symbols = list(resolved_inputs[name].get(INPUT_NODE_ID, []))
+    if len(symbols) != 1 or not symbols[0].strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "dynamic workflow requires exactly one non-empty symbol per "
+                f"run; got {len(symbols)}"
+            ),
+        )
+
+
+def _extract_leaf_outputs(
+    outputs: dict[str, Any], expected_names: list[str]
+) -> dict[str, list[str]]:
+    """Extract the archived leaf outputs for the expected leaf set.
+
+    ``expected_names`` lists the ``leaf_<internal_id>`` output names for the
+    round's leaves. Every expected leaf must be present, be a list, and carry
+    exactly one value (the single-symbol contract). The documented archive
+    representation is a list containing exactly one STRING; any other element
+    type (a decoded dict or list) is rejected rather than coerced, because
+    str()-ing a decoded value would silently degrade the observation. A missing
+    or malformed leaf raises :class:`DriverProtocolError`.
+    """
+    present: dict[str, list[str]] = {}
+    for graph_outputs in outputs.values():
+        if not isinstance(graph_outputs, dict):
+            continue
+        for name, values in graph_outputs.items():
+            if name in expected_names:
+                present[name] = values
+    leaf_outputs: dict[str, list[str]] = {}
+    for name in expected_names:
+        if name not in present:
+            raise DriverProtocolError(f"round is missing expected leaf output {name!r}")
+        values = present[name]
+        if not isinstance(values, list) or len(values) != 1:
+            raise DriverProtocolError(
+                f"leaf output {name!r} must be a list with exactly one value "
+                f"(single-symbol contract), got {values!r}"
+            )
+        if not isinstance(values[0], str):
+            raise DriverProtocolError(
+                f"leaf output {name!r} must be a list containing exactly one "
+                f"string (documented archive representation), got {values[0]!r}"
+            )
+        leaf_outputs[name[len("leaf_") :]] = [values[0]]
+    return leaf_outputs
+
+
 def _dispatch_workflow_to_graph_specs(
     *,
     workflow_format: str,
@@ -195,7 +393,7 @@ def _dispatch_workflow_to_graph_specs(
 ) -> None:
     """Parse one workflow slice and merge it into ``graph_specs`` in place.
 
-    Mirrors the three formats accepted by the submit/preview endpoints:
+    Handles the three formats accepted by the submit/preview endpoints:
 
     * ``native`` — ``workflow_payload`` already contains a compiled Lumilake
       graph (optionally wrapped under a ``graph`` key); stored verbatim.
@@ -247,8 +445,7 @@ def _dispatch_workflow_to_graph_specs(
                 ),
             )
         # Override the YAML document's top-level ``name``/``inputs`` with the
-        # endpoint-chosen batch values so slicing produces distinct graph ids,
-        # mirroring how the ``n8n`` branch's wrapper payload supplies them.
+        # endpoint-chosen batch values so slicing produces distinct graph ids.
         yaml_dict = dict(workflow_payload)
         yaml_dict["name"] = graph_name
         yaml_dict["inputs"] = batch_inputs
@@ -301,6 +498,8 @@ class JobRecord:
     result: LumilakeResponse | None = None
     folder_inputs: dict[str, str] = field(default_factory=dict)
     trace_ids: list[str] = field(default_factory=list)
+    parent_job_id: str | None = None
+    child_job_ids: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.output_location:
@@ -568,9 +767,9 @@ class JobSubmitRequest(BaseModel):
 
 
 class JobPreviewItem(BaseModel):
-    """Mirrors ``JobSubmitItem`` so the same payload can be sent to both
-    ``/jobs`` and ``/jobs/preview``.  ``output_location`` is accepted but
-    ignored during preview."""
+    """Preview entry accepting the same fields as ``JobSubmitItem``, so one
+    payload works against both ``/jobs`` and ``/jobs/preview``.
+    ``output_location`` is accepted but ignored during preview."""
 
     workflow: str = Field(
         description=(
@@ -611,9 +810,9 @@ class JobPreviewItem(BaseModel):
 
 
 class JobPreviewRequest(BaseModel):
-    """Mirrors ``JobSubmitRequest`` so the same payload can be sent to both
-    ``/jobs`` and ``/jobs/preview``.  ``priority`` is accepted but ignored
-    during preview."""
+    """Preview request accepting the same fields as ``JobSubmitRequest``, so
+    one payload works against both ``/jobs`` and ``/jobs/preview``.
+    ``priority`` is accepted but ignored during preview."""
 
     data: list[JobPreviewItem] = Field(description="Workflow preview entries.")
     priority: Priority = Field(
@@ -632,9 +831,9 @@ class JobPreviewRequest(BaseModel):
     hardware: HardwareRequirements | None = Field(
         default=None,
         description=(
-            "Hardware overrides applied during schedule preview. Mirrors"
-            " ``JobSubmitRequest.hardware`` so the same payload can be sent"
-            " to both ``/jobs`` and ``/jobs/preview``."
+            "Hardware overrides applied during schedule preview. Accepts the"
+            " same value as ``JobSubmitRequest.hardware`` so one payload works"
+            " against both ``/jobs`` and ``/jobs/preview``."
         ),
     )
 
@@ -1295,6 +1494,376 @@ async def _resolve_input_values_raw(
     )
 
 
+async def _submit_dynamic_child(
+    *,
+    parent_job_id: str,
+    graph: dict[str, Any],
+    symbols: list[str],
+    output_location: IOLocation,
+    priority: Priority,
+    principal: PrincipalContext,
+    runtime_token: str | None,
+    trace_id: str,
+    round_index: int,
+    optimizer_type: str | None = None,
+    hardware_requirements: HardwareRequirements | None = None,
+    job_timeout: float = 600.0,
+) -> str | None:
+    """Create and dispatch one dynamic round as a child job, returning its id.
+
+    The caller must check the child record's status after this returns,
+    because ``_run_job`` swallows failures.
+    """
+    child_job_id = f"req-{unique_id()}"
+    graph_name = f"round_{round_index}"
+    graph_specs = {
+        graph_name: {"graph": graph, "inputs": {INPUT_NODE_ID: list(symbols)}}
+    }
+    workflow_slices = {
+        graph_name: WorkflowSliceMeta(
+            public_graph_name=graph_name,
+            slice_index=0,
+            slice_start=0,
+            slice_length=len(symbols),
+            total_length=len(symbols),
+            template_hash=_workflow_template_hash(graph, "native"),
+            varying_input_keys=(),
+        )
+    }
+    child_record = JobRecord(
+        job_id=child_job_id,
+        status="pending",
+        submitted_at=_now(),
+        inputs={graph_name: {INPUT_NODE_ID: list(symbols)}},
+        output_location={graph_name: output_location},
+        org_id=principal.org_id,
+        user_id=principal.external_id,
+        progress=JobProgress(),
+        parent_job_id=parent_job_id,
+    )
+    async with jobs_lock:
+        parent_record = jobs.get(parent_job_id)
+        # Atomic pre-round check + child creation: if the parent is already
+        # terminal, do not create or dispatch this child.
+        if parent_record is None or parent_record.status in TERMINAL_JOB_STATUSES:
+            return None
+        jobs[child_job_id] = child_record
+        if child_job_id not in parent_record.child_job_ids:
+            parent_record.child_job_ids.append(child_job_id)
+    await asyncio.to_thread(_job_storage.save, child_record)
+    if parent_record is not None:
+        await asyncio.to_thread(_job_storage.save, parent_record)
+    await register_resource(
+        principal,
+        ResourceKind.JOB,
+        child_job_id,
+        {"workflow_count": 1, "status": child_record.status},
+        logger,
+    )
+    task = asyncio.create_task(
+        _run_job(
+            child_job_id,
+            graph_specs,
+            workflow_slices,
+            child_record,
+            priority,
+            principal,
+            runtime_token,
+            trace_id,
+            optimizer_type,
+            hardware_requirements,
+            suppress_hooks=True,
+        )
+    )
+    try:
+        await asyncio.wait_for(task, timeout=job_timeout)
+    except TimeoutError:
+        task.cancel()
+        # Cancel the backend runtime request too — cancelling the local waiter
+        # does not remove the queued runtime request.
+        try:
+            server = LumilakeServer.get_started_instance()
+            await server.cancel_request(child_job_id)
+        except Exception as exc:
+            # The backend cancellation failed, so the child must not be
+            # recorded as cancelled — that would falsely claim the backend
+            # work was cancelled. Record it as failed with the error.
+            async with jobs_lock:
+                child_record.status = "failed"
+                child_record.error = f"cancellation failed after timeout: {exc}"
+                child_record.finished_at = _now()
+            await asyncio.to_thread(_job_storage.save, child_record)
+            raise TimeoutError(
+                f"dynamic round {round_index} ({child_job_id}) exceeded "
+                f"job_timeout {job_timeout}s and backend cancellation failed"
+            ) from exc
+        # Mark the child cancelled so it does not remain running forever.
+        async with jobs_lock:
+            child_record.status = "cancelled"
+            child_record.finished_at = _now()
+        await asyncio.to_thread(_job_storage.save, child_record)
+        raise TimeoutError(
+            f"dynamic round {round_index} ({child_job_id}) exceeded "
+            f"job_timeout {job_timeout}s"
+        ) from None
+    return child_job_id
+
+
+async def _fire_parent_terminal_hooks(
+    record: JobRecord,
+    principal: PrincipalContext,
+    parent_job_id: str,
+) -> None:
+    """Fire the parent's lifecycle hooks once for a terminal dynamic run.
+
+    Aggregates the children's trace ids onto the parent record and persists
+    it, then emits usage and registers the trace resources. No-op unless the
+    record has reached a terminal state.
+    """
+    async with jobs_lock:
+        if record.status not in TERMINAL_JOB_STATUSES or record.finished_at is None:
+            return
+    trace_ids: list[str] = []
+    async with jobs_lock:
+        for child_id in record.child_job_ids:
+            child_record = jobs.get(child_id)
+            if child_record is not None:
+                trace_ids.extend(child_record.trace_ids)
+    try:
+        server = LumilakeServer.get_started_instance()
+        trace_ids.extend(server.trace_ids_for_request(parent_job_id))
+    except Exception:
+        logger.exception("Failed to resolve trace ids for job %s", parent_job_id)
+    trace_ids = list(dict.fromkeys(trace_ids))
+    async with jobs_lock:
+        record.trace_ids = trace_ids
+        # Snapshot under the lock so a concurrent writer (e.g. cancel_job's
+        # unlocked save) cannot interleave a stale snapshot that omits the
+        # trace ids. The snapshot, not the IO, is what must be atomic.
+        snapshot = copy.deepcopy(record)
+    await asyncio.to_thread(_job_storage.save, snapshot)
+    await emit_usage([_usage_row(record, principal)], logger)
+    for trace_id in trace_ids:
+        try:
+            await register_resource(
+                principal,
+                ResourceKind.TRACE,
+                trace_id,
+                {"job_id": parent_job_id},
+                logger,
+            )
+        except Exception:
+            logger.exception("Failed to register trace %s", trace_id)
+
+
+async def _run_dynamic_job(
+    parent_job_id: str,
+    spec: DynamicSpec,
+    record: JobRecord,
+    symbols: list[str],
+    output_location: IOLocation,
+    priority: Priority,
+    principal: PrincipalContext,
+    runtime_token: str | None,
+    trace_id: str,
+    optimizer_type: str | None = None,
+    hardware_requirements: HardwareRequirements | None = None,
+) -> None:
+    """Run the dynamic planning-agent loop server-side.
+
+    Each round is a child job. After awaiting each round's ``_run_job``, the
+    child record's status is checked: a failed/cancelled round fails the
+    parent. The loop stops on ``StopPlan`` or ``max_rounds``.
+    """
+    set_trace_id(trace_id)
+    try:
+        async with jobs_lock:
+            terminal_before_start = record.status in TERMINAL_JOB_STATUSES
+            if not terminal_before_start:
+                record.status = "running"
+                record.started_at = _now()
+        if terminal_before_start:
+            return
+        await asyncio.to_thread(_job_storage.save, record)
+
+        run_namespace = f"run-{uuid.uuid4().hex}"
+        max_rounds = spec.driver.max_rounds
+        max_nodes = spec.driver.max_nodes_per_round
+        # Global node registry: every node ever emitted, keyed by its user-facing
+        # id. Nodes are immutable once created.
+        node_registry: dict[str, dict[str, Any]] = {}
+        observations: list[str] = []
+        stopped_by: str | None = None
+        plans: list[dict[str, Any]] = []
+
+        round_index = 0
+        current_subgraph: list[dict[str, Any]] = []
+        while round_index < max_rounds:
+            topology = list(node_registry.keys())
+            try:
+                round_build = build_round(
+                    current_subgraph,
+                    node_registry=node_registry,
+                    round_index=round_index,
+                    goal=spec.goal,
+                    observations=observations,
+                    topology=topology,
+                    preview_width=spec.driver.preview_width,
+                    model=spec.driver.model,
+                    max_tokens=spec.driver.max_tokens,
+                    temperature=spec.driver.temperature,
+                    threshold=spec.driver.threshold,
+                    library=spec.library,
+                    chat_template_kwargs=spec.driver.chat_template_kwargs,
+                )
+            except (DriverProtocolError, ValueError) as exc:
+                async with jobs_lock:
+                    if record.status in TERMINAL_JOB_STATUSES:
+                        return
+                    record.status = "failed"
+                    record.error = f"dynamic round {round_index} failed to build: {exc}"
+                    record.finished_at = _now()
+                await asyncio.to_thread(_job_storage.save, record)
+                return
+            try:
+                child_job_id = await _submit_dynamic_child(
+                    parent_job_id=parent_job_id,
+                    graph=round_build.graph,
+                    symbols=symbols,
+                    output_location=_IO_LOCATION_ADAPTER.validate_python(
+                        round_output_location(
+                            output_location.model_dump(), run_namespace, round_index
+                        )
+                    ),
+                    priority=priority,
+                    principal=principal,
+                    runtime_token=runtime_token,
+                    trace_id=trace_id,
+                    round_index=round_index,
+                    optimizer_type=optimizer_type,
+                    hardware_requirements=hardware_requirements,
+                    job_timeout=spec.driver.job_timeout,
+                )
+            except TimeoutError as exc:
+                async with jobs_lock:
+                    if record.status in TERMINAL_JOB_STATUSES:
+                        return
+                    record.status = "failed"
+                    record.error = str(exc)
+                    record.finished_at = _now()
+                await asyncio.to_thread(_job_storage.save, record)
+                return
+            if child_job_id is None:
+                # The parent was cancelled at child-creation time; no child was
+                # created or dispatched. Stop without failing the parent.
+                return
+            async with jobs_lock:
+                child = jobs[child_job_id]
+                child_status = child.status
+            if child_status != "completed":
+                async with jobs_lock:
+                    if record.status in TERMINAL_JOB_STATUSES:
+                        return
+                    if child_status == "cancelled":
+                        record.status = "cancelled"
+                        record.error = (
+                            f"dynamic round {round_index} ({child_job_id}) "
+                            "was cancelled"
+                        )
+                    else:
+                        record.status = "failed"
+                        record.error = (
+                            f"dynamic round {round_index} ({child_job_id}) "
+                            f"terminated with status {child_status!r}"
+                        )
+                    record.finished_at = _now()
+                await asyncio.to_thread(_job_storage.save, record)
+                return
+            result = child.result
+            if result is None:
+                async with jobs_lock:
+                    if record.status in TERMINAL_JOB_STATUSES:
+                        return
+                    record.status = "failed"
+                    record.error = f"dynamic round {round_index} produced no result"
+                    record.finished_at = _now()
+                await asyncio.to_thread(_job_storage.save, record)
+                return
+            try:
+                outputs = result_outputs({"result": {"outputs": result.outputs}})
+                plan = validate_plan(outputs)
+                plans.append(plan_to_dict(plan))
+                # Validate the round's archived leaf outputs BEFORE the STOP
+                # break, so the round-result integrity contract holds even for
+                # the terminal STOP round. Every expected leaf must have
+                # produced exactly one value.
+                leaf_outputs = _extract_leaf_outputs(
+                    outputs, round_build.leaf_output_names
+                )
+                observations.append(
+                    compute_observation(leaf_outputs, spec.driver.preview_width)
+                )
+                if isinstance(plan, StopPlan):
+                    stopped_by = STOP
+                    break
+                current_subgraph = plan.ops
+                validate_emitted_subgraph(
+                    current_subgraph,
+                    node_registry,
+                    max_nodes,
+                    spec.library,
+                )
+                # Store the RESOLVED ops in the registry so a later round that
+                # references a prior op gets a full config (with an `op` field),
+                # not the raw emitted ref.
+                current_subgraph = resolve_subgraph(current_subgraph, spec.library)
+                for op in current_subgraph:
+                    node_registry[op["id"]] = op
+            except (DriverProtocolError, ValueError) as exc:
+                async with jobs_lock:
+                    if record.status in TERMINAL_JOB_STATUSES:
+                        return
+                    record.status = "failed"
+                    record.error = (
+                        f"dynamic round {round_index} produced an invalid plan: {exc}"
+                    )
+                    record.finished_at = _now()
+                await asyncio.to_thread(_job_storage.save, record)
+                return
+            round_index += 1
+        if stopped_by is None:
+            stopped_by = "max_rounds"
+        async with jobs_lock:
+            # A terminal status that raced in during the loop is authoritative.
+            if record.status in TERMINAL_JOB_STATUSES:
+                return
+            record.status = "completed"
+            record.finished_at = _now()
+            record.result = LumilakeResponse(
+                outputs={"round": {"plan": [json.dumps(plans)]}}
+            )
+        await asyncio.to_thread(_job_storage.save, record)
+    except Exception as exc:  # noqa: BLE001 - any escape must fail the parent
+        async with jobs_lock:
+            if record.status in TERMINAL_JOB_STATUSES:
+                return
+            record.status = "failed"
+            record.error = f"dynamic run failed: {exc}"
+            record.finished_at = _now()
+        try:
+            await asyncio.to_thread(_job_storage.save, record)
+        except Exception as save_exc:  # noqa: BLE001 - persistence is best-effort
+            logger.error(
+                "failed to persist failed dynamic parent %s: %s",
+                parent_job_id,
+                save_exc,
+            )
+    finally:
+        # Fire the parent's lifecycle hooks once, when it reaches a terminal
+        # state. Children suppress their own hooks (they are internal).
+        await _fire_parent_terminal_hooks(record, principal, parent_job_id)
+
+
 async def _run_job(
     job_id: str,
     graph_specs: dict[str, dict[str, Any]],
@@ -1307,21 +1876,22 @@ async def _run_job(
     optimizer_type: str | None = None,
     hardware_requirements: HardwareRequirements | None = None,
     parsed_graphs: dict[str, CompiledGraph] | None = None,
+    suppress_hooks: bool = False,
 ) -> None:
     set_trace_id(trace_id)
     server = LumilakeServer.get_started_instance()
 
     async with jobs_lock:
-        if record.status == "cancelled":
-            cancelled_before_start = True
+        if record.status in TERMINAL_JOB_STATUSES:
+            terminal_before_start = True
         else:
-            cancelled_before_start = False
+            terminal_before_start = False
             record.status = "running"
             record.started_at = _now()
             record.progress.queuing.completed = True
     await asyncio.to_thread(_job_storage.save, record)
-    if cancelled_before_start:
-        if record.finished_at:
+    if terminal_before_start:
+        if record.finished_at and not suppress_hooks:
             await emit_usage([_usage_row(record, principal)], logger)
         return
 
@@ -1397,13 +1967,14 @@ async def _run_job(
                 "Failed to resolve job-manager timing for job %s",
                 job_id,
             )
-        cancelled_during_finalize = False
+        already_terminal = False
         async with jobs_lock:
-            # cancel_job may have flipped status during the unlocked artifact /
-            # timing work above. The cancel is the authoritative outcome — do
+            # Another coroutine (e.g. cancel_job) may have flipped the record to
+            # a terminal status during the unlocked artifact / timing work
+            # above. Any terminal status already written is authoritative — do
             # not overwrite its status, error, or finished_at.
-            if record.status == "cancelled":
-                cancelled_during_finalize = True
+            if record.status in TERMINAL_JOB_STATUSES:
+                already_terminal = True
             else:
                 record.result = validated_result
                 record.trace_ids = list(trace_ids)
@@ -1422,34 +1993,35 @@ async def _run_job(
                 else:
                     record.status = "completed"
                     do_dump = True
-        if not cancelled_during_finalize:
+        if not already_terminal:
             await asyncio.to_thread(_job_storage.save, record)
-        for trace_id in trace_ids:
-            try:
-                await register_resource(
-                    principal,
-                    ResourceKind.TRACE,
-                    trace_id,
-                    {"job_id": job_id},
-                    logger,
-                )
-            except Exception:
-                logger.exception("Failed to register trace %s", trace_id)
-        for artifact_uri in sorted(artifact_uris):
-            filename = _artifact_name_from_uri(artifact_uri)
-            if not filename:
-                continue
-            artifact_id = f"{job_id}/{filename}"
-            try:
-                await register_resource(
-                    principal,
-                    ResourceKind.ARTIFACT,
-                    artifact_id,
-                    {"job_id": job_id, "uri": artifact_uri},
-                    logger,
-                )
-            except Exception:
-                logger.exception("Failed to register artifact %s", artifact_id)
+        if not suppress_hooks:
+            for trace_id in trace_ids:
+                try:
+                    await register_resource(
+                        principal,
+                        ResourceKind.TRACE,
+                        trace_id,
+                        {"job_id": job_id},
+                        logger,
+                    )
+                except Exception:
+                    logger.exception("Failed to register trace %s", trace_id)
+            for artifact_uri in sorted(artifact_uris):
+                filename = _artifact_name_from_uri(artifact_uri)
+                if not filename:
+                    continue
+                artifact_id = f"{job_id}/{filename}"
+                try:
+                    await register_resource(
+                        principal,
+                        ResourceKind.ARTIFACT,
+                        artifact_id,
+                        {"job_id": job_id, "uri": artifact_uri},
+                        logger,
+                    )
+                except Exception:
+                    logger.exception("Failed to register artifact %s", artifact_id)
         if do_dump:
             try:
                 result_outputs = record.result.outputs if record.result else {}
@@ -1464,16 +2036,37 @@ async def _run_job(
                 )
     except RequestCancelledError:
         logger.info("Job %s cancelled", job_id)
+        async with jobs_lock:
+            if record.status not in TERMINAL_JOB_STATUSES:
+                record.status = "cancelled"
+                record.finished_at = _now()
         return
     except Exception as exc:  # pragma: no cover
         logger.exception("Job %s failed with exception", job_id)
         async with jobs_lock:
-            if record.status != "cancelled":
+            if record.status not in TERMINAL_JOB_STATUSES:
                 record.status = "failed"
                 if not record.error:
                     record.error = str(exc)
                 record.finished_at = _now()
     finally:
+        # Capture the child's trace ids on every termination path (success,
+        # cancellation, timeout/CancelledError, failure) BEFORE the runtime
+        # mapping is released below, so the parent can still aggregate them.
+        # The child still suppresses its own hooks.
+        final_trace_ids: list[str] = []
+        try:
+            final_trace_ids = server.trace_ids_for_request(job_id)
+        except Exception:
+            logger.exception("Failed to resolve trace ids for job %s", job_id)
+        final_trace_ids = [
+            trace_id.strip() for trace_id in final_trace_ids if trace_id.strip()
+        ]
+        if final_trace_ids:
+            async with jobs_lock:
+                record.trace_ids = list(
+                    dict.fromkeys([*record.trace_ids, *final_trace_ids])
+                )
         await asyncio.to_thread(_job_storage.save, record)
         prefix = f"request::{job_id}::"
         stale_keys = [key for key in data_profile_registry if key.startswith(prefix)]
@@ -1483,7 +2076,11 @@ async def _run_job(
             server.release_request_workflows(job_id)
         except Exception:
             logger.exception("Failed to release runtime trace state for job %s", job_id)
-        if record.status in {"completed", "failed", "cancelled"} and record.finished_at:
+        if (
+            not suppress_hooks
+            and record.status in TERMINAL_JOB_STATUSES
+            and record.finished_at
+        ):
             await emit_usage([_usage_row(record, principal)], logger)
 
 
@@ -1619,7 +2216,7 @@ async def preview_job(
         alias="Workflow-Format",
         description=(
             "Workflow format: `native` (compiled Lumilake graph JSON), "
-            "`n8n` (n8n workflow payload), or `yaml` (Lumilake YAML workflow)."
+            "`n8n` (n8n workflow payload), `yaml` (Lumilake YAML workflow)."
         ),
     ),
 ) -> dict[str, Any]:
@@ -1660,7 +2257,6 @@ async def preview_job(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="data must contain at least one entry",
         )
-
     graph_specs: dict[str, dict[str, Any]] = {}
     workflow_slices: dict[str, WorkflowSliceMeta] = {}
     seen_public_names: set[str] = set()
@@ -1668,6 +2264,26 @@ async def preview_job(
 
     for idx, entry in enumerate(entries):
         workflow_payload = _decode_workflow_body(entry.workflow, workflow_format, idx)
+        is_dynamic = (
+            workflow_format == "yaml"
+            and isinstance(workflow_payload, dict)
+            and workflow_payload.get("type") == "dynamic"
+        )
+        if is_dynamic and len(entries) != 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="dynamic workflow requires exactly one entry per submission",
+            )
+        if is_dynamic:
+            dynamic_spec = _decode_dynamic_spec(entry.workflow, idx)
+            workflow_payload, dynamic_output_location = _render_dynamic_round0(
+                dynamic_spec
+            )
+            # Validate the effective output location the same way /jobs does,
+            # so both doors reject the same malformed dynamic specs.
+            _effective_dynamic_output_location(
+                dynamic_output_location, entry.output_location
+            )
 
         name = entry.name or f"graph_{idx}"
         if name in seen_public_names:
@@ -1694,6 +2310,9 @@ async def preview_job(
                 detail=str(exc),
             ) from exc
 
+        if is_dynamic:
+            _validate_dynamic_submission({name: inputs})
+
         input_batch_size = entry.input_batch_size
         if input_batch_size is not None and input_batch_size <= 0:
             raise HTTPException(
@@ -1719,7 +2338,7 @@ async def preview_job(
                 detail=f"duplicate internal graph name: {graph_name}",
             )
         _dispatch_workflow_to_graph_specs(
-            workflow_format=workflow_format,
+            workflow_format="native" if is_dynamic else workflow_format,
             workflow_payload=workflow_payload,
             batch_inputs=first_batch,
             graph_name=graph_name,
@@ -1740,7 +2359,7 @@ async def preview_job(
     server = LumilakeServer.get_started_instance()
     try:
         graphs = server.parse_query(graph_specs)
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, RuntimeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Graph compilation failed: {exc}",
@@ -1960,7 +2579,7 @@ async def submit_job(
         alias="Workflow-Format",
         description=(
             "Workflow format: `native` (compiled Lumilake graph JSON), "
-            "`n8n` (n8n workflow payload), or `yaml` (Lumilake YAML workflow)."
+            "`n8n` (n8n workflow payload), `yaml` (Lumilake YAML workflow)."
         ),
     ),
 ) -> dict[str, Any]:
@@ -2008,8 +2627,25 @@ async def submit_job(
     resolved_inputs: dict[str, dict[str, list[str]]] = {}
     output_locations: dict[str, IOLocation] = {}
     seen_public_names: set[str] = set()
+    dynamic_spec: DynamicSpec | None = None
     for idx, entry in enumerate(entries):
+        dynamic_output_location: dict[str, Any] | None = None
         workflow_payload = _decode_workflow_body(entry.workflow, workflow_format, idx)
+        is_dynamic = (
+            workflow_format == "yaml"
+            and isinstance(workflow_payload, dict)
+            and workflow_payload.get("type") == "dynamic"
+        )
+        if is_dynamic and len(entries) != 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="dynamic workflow requires exactly one entry per submission",
+            )
+        if is_dynamic:
+            dynamic_spec = _decode_dynamic_spec(entry.workflow, idx)
+            workflow_payload, dynamic_output_location = _render_dynamic_round0(
+                dynamic_spec
+            )
 
         name = entry.name or f"graph_{idx}"
         if name in seen_public_names:
@@ -2019,12 +2655,14 @@ async def submit_job(
             )
         seen_public_names.add(name)
         inputs: dict[str, list[str]] = {}
-        output_location = _resolve_output_location(entry.output_location)
-        if isinstance(output_location, DBLocation):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="DBLocation output is not supported",
-            )
+        # Determine the effective output location first: a dynamic spec's
+        # declared driver.output_location takes precedence over the envelope's.
+        output_location = _effective_dynamic_output_location(
+            dynamic_output_location, entry.output_location
+        )
+        # Authorize and validate only the effective location. The ignored
+        # envelope location (when the driver location has precedence) is
+        # neither authorized nor validated.
         await _require_location_permission(
             output_location,
             ResourceAction.WRITE,
@@ -2095,7 +2733,7 @@ async def submit_job(
                 {key: list(vals) for key, vals in batch_inputs.items()},
             )
             _dispatch_workflow_to_graph_specs(
-                workflow_format=workflow_format,
+                workflow_format="native" if is_dynamic else workflow_format,
                 workflow_payload=workflow_payload,
                 batch_inputs=batch_inputs,
                 graph_name=graph_name,
@@ -2115,7 +2753,7 @@ async def submit_job(
     server = LumilakeServer.get_started_instance()
     try:
         graphs = server.parse_query(graph_specs)
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, RuntimeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Graph compilation failed: {exc}",
@@ -2133,6 +2771,11 @@ async def submit_job(
                 "diffusers / text-to-image). Drop --gpu 0 or remove the GPU op."
             ),
         )
+
+    if is_dynamic and dynamic_spec is not None:
+        # Validate the one-symbol contract before creating the parent record,
+        # so an invalid request returns 422 without leaving an orphan job.
+        _validate_dynamic_submission(resolved_inputs)
 
     record = JobRecord(
         job_id=job_id,
@@ -2156,21 +2799,42 @@ async def submit_job(
         hook_logger,
     )
 
-    task = asyncio.create_task(
-        _run_job(
-            job_id,
-            graph_specs,
-            workflow_slices,
-            record,
-            priority,
-            principal,
-            get_runtime_token(request),
-            str(getattr(request.state, "trace_id", job_id)),
-            optimizer,
-            hardware,
-            graphs,
+    if is_dynamic and dynamic_spec is not None:
+        # The dynamic run is the parent; each round is a child job.
+        name = next(iter(resolved_inputs))
+        symbols = list(resolved_inputs[name].get(INPUT_NODE_ID, []))
+        effective_location = output_locations[name]
+        task = asyncio.create_task(
+            _run_dynamic_job(
+                job_id,
+                dynamic_spec,
+                record,
+                symbols,
+                effective_location,
+                priority,
+                principal,
+                get_runtime_token(request),
+                str(getattr(request.state, "trace_id", job_id)),
+                optimizer,
+                hardware,
+            )
         )
-    )
+    else:
+        task = asyncio.create_task(
+            _run_job(
+                job_id,
+                graph_specs,
+                workflow_slices,
+                record,
+                priority,
+                principal,
+                get_runtime_token(request),
+                str(getattr(request.state, "trace_id", job_id)),
+                optimizer,
+                hardware,
+                graphs,
+            )
+        )
     request.app.state.background_tasks.add(task)
     task.add_done_callback(request.app.state.background_tasks.discard)
     return {"ok": True, "data": {"job_id": job_id, "status": record.status}}
@@ -2303,7 +2967,7 @@ async def cancel_job(
     )
 
     async with jobs_lock:
-        if record.status in {"completed", "failed", "cancelled"}:
+        if record.status in TERMINAL_JOB_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=JobAlreadyFinishedDetail(
@@ -2328,6 +2992,35 @@ async def cancel_job(
             logger.warning(
                 "Failed to cancel job %s in runtime backend", job_id, exc_info=True
             )
+
+    # A dynamic parent's cancellation must reach its in-flight children.
+    for child_id in list(record.child_job_ids):
+        async with jobs_lock:
+            child = jobs.get(child_id)
+            if child is None or child.status in TERMINAL_JOB_STATUSES:
+                continue
+            child.status = "cancelled"
+            if not child.error:
+                child.error = "cancelled by parent"
+            child.finished_at = _now()
+        await asyncio.to_thread(_job_storage.save, child)
+        if server.is_started:
+            try:
+                await server.cancel_request(child_id)
+            except Exception as exc:
+                # The backend cancellation failed, so the child must not be
+                # recorded as cancelled — that would falsely claim the backend
+                # work was cancelled. Record it as failed with the error.
+                async with jobs_lock:
+                    child.status = "failed"
+                    child.error = f"cancellation failed: {exc}"
+                    child.finished_at = _now()
+                await asyncio.to_thread(_job_storage.save, child)
+                logger.warning(
+                    "Failed to cancel child %s in runtime backend",
+                    child_id,
+                    exc_info=True,
+                )
 
     return {"ok": True, "data": {"job_id": job_id, "status": record.status}}
 

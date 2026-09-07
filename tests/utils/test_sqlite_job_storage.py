@@ -11,6 +11,7 @@ use, so nothing here touches the network.
 
 import datetime as dt
 import json
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -49,6 +50,7 @@ class _Rec:
     started_at: str | None = None
     finished_at: str | None = None
     error: str | None = None
+    parent_job_id: str | None = None
     inputs: dict[str, Any] = field(default_factory=dict)
     output_location: dict[str, Any] = field(default_factory=dict)
     progress: dict[str, Any] = field(default_factory=dict)
@@ -318,3 +320,108 @@ def test_survives_reopen(tmp_path, monkeypatch) -> None:
     s1.save(_Rec(job_id="persisted"))
     s2 = SqliteJobStorage(db_path=db)
     assert {s.job_id for s in s2.iter_summaries()} == {"persisted"}
+
+
+def test_dynamic_children_hidden_from_listing_parity(tmp_path, monkeypatch) -> None:
+    """A dynamic child must be hidden from the user-facing listing exactly as
+    the blob backend hides it -- same ids AND same total."""
+    recs = [
+        _Rec(job_id="parent", status="running"),
+        _Rec(job_id="child", status="running", parent_job_id="parent"),
+    ]
+    sq, _ = _sqlite(tmp_path, monkeypatch)
+    for r in recs:
+        sq.save(r)
+    bl = _blob("arc2", monkeypatch)
+    for r in recs:
+        bl.save(r)
+
+    got = sq.list_summaries(
+        org_id="test-org",
+        user_id=None,
+        job_ids=None,
+        statuses=None,
+        page=1,
+        page_size=10,
+    )
+    want = bl.list_summaries(
+        org_id="test-org",
+        user_id=None,
+        job_ids=None,
+        statuses=None,
+        page=1,
+        page_size=10,
+    )
+    assert got == want
+    # The total must agree too; a post-fetch filter would hide the child from
+    # the page but leave the total wrong.
+    assert got[1] == want[1] == 1
+    assert {row["job_id"] for row in got[0]} == {"parent"}
+
+
+def test_child_summary_round_trips(tmp_path, monkeypatch) -> None:
+    """parent_job_id must survive a write/read round trip through SQLite."""
+    storage, _ = _sqlite(tmp_path, monkeypatch)
+    storage.save(_Rec(job_id="child", status="running", parent_job_id="parent"))
+    # iter_summaries does not hide children, so it can read the child back.
+    child = next(s for s in storage.iter_summaries() if s.job_id == "child")
+    assert child.parent_job_id == "parent"
+
+
+def test_iter_summaries_still_sees_children(tmp_path, monkeypatch) -> None:
+    """iter_summaries must NOT hide children: shutdown recovery depends on
+    seeing in-flight child jobs to mark them failed."""
+    storage, _ = _sqlite(tmp_path, monkeypatch)
+    storage.save(_Rec(job_id="parent", status="running"))
+    storage.save(_Rec(job_id="child", status="running", parent_job_id="parent"))
+    ids = {s.job_id for s in storage.iter_summaries()}
+    assert "child" in ids, (
+        "iter_summaries must still return children; shutdown recovery needs "
+        "them to mark in-flight child jobs failed"
+    )
+
+
+def test_parent_job_id_column_migration_is_idempotent(tmp_path, monkeypatch) -> None:
+    """An existing table without the column must gain it via migration, and
+    running the migration twice must be a no-op that keeps existing rows."""
+    _wire_blobs("arc", monkeypatch)
+    monkeypatch.setattr(job_storage_module.envs, "LUMILAKE_JOB_INDEX_RETENTION_DAYS", 0)
+    db = str(tmp_path / "jobs.sqlite")
+    # Build a legacy table WITHOUT parent_job_id and seed a row.
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE job_summaries ("
+        " job_id TEXT PRIMARY KEY, org_id TEXT NOT NULL, user_id TEXT NOT NULL,"
+        " status TEXT NOT NULL, submitted_at TEXT NOT NULL,"
+        " submitted_at_ts REAL NOT NULL, started_at TEXT, finished_at TEXT,"
+        " optimization_seconds REAL, selection_seconds REAL,"
+        " clustering_seconds REAL, error TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO job_summaries (job_id, org_id, user_id, status, submitted_at,"
+        " submitted_at_ts) VALUES ('legacy', 'test-org', 'u', 'completed',"
+        " '2025-01-01T00:00:00+00:00', 0.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    # First open runs the migration.
+    SqliteJobStorage(db_path=db)
+    # Second open runs it again; must be a no-op.
+    s2 = SqliteJobStorage(db_path=db)
+
+    columns = {
+        row["name"]
+        for row in s2._conn.execute("PRAGMA table_info(job_summaries)").fetchall()
+    }
+    assert "parent_job_id" in columns
+    # Existing rows survive the migration.
+    rows, _ = s2.list_summaries(
+        org_id="test-org",
+        user_id=None,
+        job_ids=None,
+        statuses=None,
+        page=1,
+        page_size=10,
+    )
+    assert {row["job_id"] for row in rows} == {"legacy"}

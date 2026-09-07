@@ -33,9 +33,42 @@ def _normalize_payload(value: Any) -> Any:
 class JobStorage:
     def __init__(self) -> None:
         self.logger = logging.getLogger("JobStorage")
+        # One lock per job id, kept for the process lifetime. Evicting an entry
+        # is unsafe without refcounting: a thread holding lock L could be
+        # racing a thread that evicts L (unlocked) and a third that creates L2,
+        # reintroducing the stale-write race. Bounded by the number of distinct
+        # job ids seen, which is acceptable for the server's job volume.
+        self._save_locks: dict[str, threading.Lock] = {}
+        self._save_locks_guard = threading.Lock()
+
+    def _save_lock(self, job_id: str) -> threading.Lock:
+        """Return the per-job write lock, creating it on first use.
+
+        ``save`` runs via ``asyncio.to_thread``, so this is a
+        ``threading.Lock``. The guard lock serializes only the
+        create-and-insert, so racing first saves for one job id share a lock.
+        """
+        lock = self._save_locks.get(job_id)
+        if lock is None:
+            with self._save_locks_guard:
+                lock = self._save_locks.get(job_id)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._save_locks[job_id] = lock
+        return lock
+
+    def save(self, record: Any) -> None:
+        """Persist ``record`` under its per-job write lock.
+
+        Backends implement :meth:`_save_locked`; holding the lock here means
+        every backend serializes writes for one job id, including any added
+        later.
+        """
+        with self._save_lock(record.job_id):
+            self._save_locked(record)
 
     @abstractmethod
-    def save(self, record: Any) -> None:
+    def _save_locked(self, record: Any) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -86,6 +119,7 @@ class JobSummary(BaseModel):
     selection_seconds: float | None = None
     clustering_seconds: float | None = None
     error: str | None = None
+    parent_job_id: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -103,6 +137,7 @@ def _summary_from_payload(data: dict[str, Any]) -> JobSummary:
         "selection_seconds": data.get("selection_seconds"),
         "clustering_seconds": data.get("clustering_seconds"),
         "error": data["error"] if "error" in data else None,
+        "parent_job_id": data.get("parent_job_id"),
     }
     return JobSummary.model_validate(payload)
 
@@ -136,6 +171,10 @@ def _filter_summaries(
             continue
         if statuses and summary.status not in statuses:
             continue
+        # Dynamic children are internal to their parent; hide them from the
+        # user-facing listing.
+        if summary.parent_job_id is not None:
+            continue
         filtered.append(summary)
     return filtered
 
@@ -151,7 +190,7 @@ class InMemoryJobStorage(JobStorage):
         self._artifacts: dict[str, dict[str, tuple[bytes, str]]] = {}
         self._summaries: dict[str, JobSummary] = {}
 
-    def save(self, record: Any) -> None:
+    def _save_locked(self, record: Any) -> None:
         data = _normalize_payload(asdict(record))
         record_data = dict(data)
         record_data.pop("inputs", None)
@@ -308,7 +347,7 @@ class PersistentJobStorage(JobStorage):
             )
         return _summary_from_payload(data), obj_name
 
-    def save(self, record: Any) -> None:
+    def _save_locked(self, record: Any) -> None:
         summary, obj_name = self._save_record_blobs(record)
         index_name = self._jobs_index_name()
         with self._index_lock:
@@ -505,7 +544,8 @@ class SqliteJobStorage(PersistentJobStorage):
             optimization_seconds REAL,
             selection_seconds    REAL,
             clustering_seconds   REAL,
-            error                TEXT
+            error                TEXT,
+            parent_job_id        TEXT
         )
         """,
         # Serves the list_summaries filter (org/user/status) and its sort in one
@@ -543,6 +583,18 @@ class SqliteJobStorage(PersistentJobStorage):
             self._conn.execute("PRAGMA synchronous=NORMAL")
             for stmt in self._SCHEMA:
                 self._conn.execute(stmt)
+            # Existing databases predate the parent_job_id column; CREATE TABLE
+            # IF NOT EXISTS will not add it, so migrate it in idempotently.
+            columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(job_summaries)"
+                ).fetchall()
+            }
+            if "parent_job_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE job_summaries ADD COLUMN parent_job_id TEXT"
+                )
             self._conn.commit()
         # None = never pruned. NOT 0.0: time.monotonic()'s origin is
         # arbitrary, so on a freshly-booted host `now - 0.0 < 3600` is true and
@@ -552,7 +604,7 @@ class SqliteJobStorage(PersistentJobStorage):
 
     # ---- index writes -------------------------------------------------
 
-    def save(self, record: Any) -> None:
+    def _save_locked(self, record: Any) -> None:
         summary, obj_name = self._save_record_blobs(record)
         row = summary.model_dump(mode="json")
         with self._index_lock:
@@ -562,8 +614,8 @@ class SqliteJobStorage(PersistentJobStorage):
                     job_id, org_id, user_id, status, submitted_at,
                     submitted_at_ts, started_at, finished_at,
                     optimization_seconds, selection_seconds,
-                    clustering_seconds, error
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    clustering_seconds, error, parent_job_id
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     org_id=excluded.org_id,
                     user_id=excluded.user_id,
@@ -575,7 +627,8 @@ class SqliteJobStorage(PersistentJobStorage):
                     optimization_seconds=excluded.optimization_seconds,
                     selection_seconds=excluded.selection_seconds,
                     clustering_seconds=excluded.clustering_seconds,
-                    error=excluded.error
+                    error=excluded.error,
+                    parent_job_id=excluded.parent_job_id
                 """,
                 (
                     summary.job_id,
@@ -590,6 +643,7 @@ class SqliteJobStorage(PersistentJobStorage):
                     summary.selection_seconds,
                     summary.clustering_seconds,
                     summary.error,
+                    summary.parent_job_id,
                 ),
             )
             self._conn.commit()
@@ -621,6 +675,10 @@ class SqliteJobStorage(PersistentJobStorage):
             marks = ",".join("?" for _ in statuses)
             clauses.append(f"status IN ({marks})")
             params.extend(sorted(statuses))
+        # Dynamic children are internal to their parent; hide them from the
+        # user-facing listing. This must live in _where so the COUNT(*) and the
+        # page query agree on the same total.
+        clauses.append("parent_job_id IS NULL")
         return " AND ".join(clauses), params
 
     def list_summaries(
@@ -676,6 +734,7 @@ class SqliteJobStorage(PersistentJobStorage):
                 "selection_seconds": row["selection_seconds"],
                 "clustering_seconds": row["clustering_seconds"],
                 "error": row["error"],
+                "parent_job_id": row["parent_job_id"],
             }
         )
 
@@ -774,7 +833,7 @@ class SqliteJobStorage(PersistentJobStorage):
                     "INSERT OR REPLACE INTO job_summaries (job_id, org_id, user_id,"
                     " status, submitted_at, submitted_at_ts, started_at, finished_at,"
                     " optimization_seconds, selection_seconds, clustering_seconds,"
-                    " error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " error, parent_job_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         summary.job_id,
                         summary.org_id,
@@ -788,6 +847,7 @@ class SqliteJobStorage(PersistentJobStorage):
                         summary.selection_seconds,
                         summary.clustering_seconds,
                         summary.error,
+                        summary.parent_job_id,
                     ),
                 )
             imported += 1
